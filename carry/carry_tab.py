@@ -258,17 +258,17 @@ def render():
 
     st.header("Carry \u2014 US Treasury ETFs")
 
-    subtab1, subtab2 = st.tabs(["\U0001F534 Live Signal (Today)", "\U0001F4CA Historical Backtest"])
+    subtab1, subtab2 = st.tabs(["\U0001F534 Live Signal (This Month)", "\U0001F4CA Historical Backtest"])
 
     with subtab1:
-        st.subheader("Today's Recommended Positioning")
+        st.subheader("This Month's Recommended Positioning")
         st.caption(
             f"Fetched live from Yahoo Finance and FRED (DGS3MO) \u2014 recomputed on every "
             f"page load (cached 6h). Hysteresis rule: Long if Z > {ENTER_Z}, "
             f"Sell to cash if Z < {EXIT_Z}, otherwise hold. All 4 ETFs are carry-tested; "
             "if none are Long, 100% falls back to the 3-month T-bill."
         )
-        with st.spinner("Fetching live data and computing today's signal..."):
+        with st.spinner("Fetching live data and computing this month's signal..."):
             try:
                 live_df = build_live_dataset()
                 signaled_df = compute_signals(live_df)
