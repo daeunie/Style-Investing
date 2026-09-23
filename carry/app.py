@@ -166,33 +166,65 @@ def build_live_table(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def build_recent_history(df: pd.DataFrame, n_months: int = 6) -> pd.DataFrame:
+def build_recent_history(df: pd.DataFrame, n_months: int = 6):
     """Trailing table: one row per month, one column per instrument,
-    showing what the strategy was actually holding and at what weight
-    -- so you can check what you were meant to be carrying in prior
-    months, not just today."""
+    showing what the strategy was actually holding and at what weight.
+    Also returns a parallel boolean frame marking which cells changed
+    from the prior month, so a flip can be visually highlighted."""
 
     wide_signal = df.pivot(index="ym", columns="maturity", values="signal")
-    recent_months = wide_signal.index[-n_months:]
+    full_index = wide_signal.index
+    recent_months = full_index[-n_months:]
 
-    rows = []
+    display_rows = []
+    changed_rows = []
     for ym in recent_months:
+        idx_pos = full_index.get_loc(ym)
         longs = [m for m in CARRY_TESTED if wide_signal.loc[ym, m] == "Long"]
         n_long = len(longs)
+        was_tbill_active = False
+        if idx_pos > 0:
+            prior_ym = full_index[idx_pos - 1]
+            prior_longs = [m for m in CARRY_TESTED if wide_signal.loc[prior_ym, m] == "Long"]
+            was_tbill_active = len(prior_longs) == 0
+
         row = {"Month": str(ym)}
+        changed = {"Month": False}
         for m in CARRY_TESTED:
             sig = wide_signal.loc[ym, m]
+            prior_sig = wide_signal.loc[full_index[idx_pos - 1], m] if idx_pos > 0 else None
             if sig == "Long":
                 weight = round(100 / n_long, 1) if n_long > 0 else 0.0
                 row[m] = f"Long ({weight}%)"
             else:
                 row[m] = "Cash (0%)"
-        tbill_weight = 100.0 if n_long == 0 else 0.0
-        row["3-Month T-Bill"] = f"{tbill_weight}%"
-        rows.append(row)
+            changed[m] = (prior_sig is not None) and (sig != prior_sig)
 
-    # Most recent month first
-    return pd.DataFrame(rows).iloc[::-1].reset_index(drop=True)
+        is_tbill_active = n_long == 0
+        row["3-Month T-Bill"] = f"{100.0 if is_tbill_active else 0.0}%"
+        changed["3-Month T-Bill"] = (idx_pos > 0) and (is_tbill_active != was_tbill_active)
+
+        display_rows.append(row)
+        changed_rows.append(changed)
+
+    display_df = pd.DataFrame(display_rows).iloc[::-1].reset_index(drop=True)
+    changed_df = pd.DataFrame(changed_rows).iloc[::-1].reset_index(drop=True)
+    return display_df, changed_df
+
+
+def highlight_changes(display_df: pd.DataFrame, changed_df: pd.DataFrame):
+    """Return a pandas Styler that highlights any cell marked True in
+    changed_df with a yellow background and bold text."""
+
+    def style_func(_):
+        styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
+        for col in changed_df.columns:
+            styles[col] = changed_df[col].map(
+                lambda changed: "background-color: #FFF3B0; font-weight: bold;" if changed else ""
+            )
+        return styles
+
+    return display_df.style.apply(style_func, axis=None)
 
 
 # ==================== Tab 2: Historical Backtest (static, pre-computed) ====================
@@ -246,11 +278,15 @@ with tab1:
 
             st.subheader("Recent History \u2014 What Were We Meant to Be Carrying")
             st.caption(
-                "Last 6 months' positioning, most recent first \u2014 useful for checking "
-                "what the strategy actually called for in prior months, not just today."
+                "Last 6 months' positioning, most recent first \u2014 highlighted cells "
+                "mark a change from the prior month (a flip in/out of that position)."
             )
-            recent_history = build_recent_history(signaled_df, n_months=6)
-            st.dataframe(recent_history, use_container_width=True, hide_index=True)
+            recent_display, recent_changed = build_recent_history(signaled_df, n_months=6)
+            st.dataframe(
+                highlight_changes(recent_display, recent_changed),
+                use_container_width=True,
+                hide_index=True,
+            )
         except Exception as e:
             st.error("Couldn't fetch live data right now. Try refreshing in a few minutes.")
             st.exception(e)
