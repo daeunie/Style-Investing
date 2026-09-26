@@ -17,11 +17,10 @@ import streamlit as st
 import yfinance as yf
 
 CARRY_TESTED = ["SHY", "IEI", "IEF", "TLT"]
-DURATIONS = {"SHY": 1.9, "IEI": 4.5, "IEF": 7.5, "TLT": 17.0}
 TTM_WINDOW = 12
-ZSCORE_WINDOW = 24
-ENTER_Z = 0.5
-EXIT_Z = -0.5
+ZSCORE_WINDOW = 72
+ENTER_Z = 1.0
+EXIT_Z = -1.0
 
 FRED_TBILL_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
 
@@ -84,7 +83,7 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     def compute_carry(row):
         if pd.isna(row["ttm_yield"]) or pd.isna(row["tbill"]):
             return float("nan")
-        return (row["ttm_yield"] - row["tbill"]) / DURATIONS[row["maturity"]]
+        return row["ttm_yield"] - row["tbill"]
 
     df["carry_adj"] = df.apply(compute_carry, axis=1)
 
