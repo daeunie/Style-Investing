@@ -301,6 +301,18 @@ def render():
         })
         rf = cmp["ret_tbill"]
 
+        st.subheader("Backtest Period")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Start", rets.index[0].strftime("%b %Y"))
+        c2.metric("End", rets.index[-1].strftime("%b %Y"))
+        c3.metric("Length", f"{len(rets)} months ({len(rets) / 12:.1f} yrs)")
+        st.caption(
+            f"Start = first month all 4 ETFs have returns (IEI launched Jan 2007). "
+            f"End = last month of the Bloomberg US Treasury Index data, so all three series are "
+            f"compared over the same period. Weights, duration and turnover below run to "
+            f"{bt.index[-1].strftime('%b %Y')}."
+        )
+
         st.subheader("Cumulative Growth of $1")
         st.caption(
             f"Strategy: {WINDOW}m z-score, +{ENTER_Z} / {EXIT_Z} thresholds, monthly rebalance, "
