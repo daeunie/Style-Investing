@@ -115,8 +115,8 @@ def build_live_table(sig: dict, ylds: pd.DataFrame) -> pd.DataFrame:
     rows.append({
         "Instrument": "3-Month T-Bill",
         "Yield used": f"{TBILL} = {ylds.at[t, TBILL]:.2f}%",
-        "Carry (%p)": None,
-        "Z-score": None,
+        "Carry (%p)": np.nan,
+        "Z-score": np.nan,
         "Action": "Fallback (cash)" if n_long == 0 else "Not used",
         "Weight (%)": 100.0 if n_long == 0 else 0.0,
     })
@@ -148,7 +148,7 @@ def highlight_changes(display_df: pd.DataFrame, changed_df: pd.DataFrame):
         styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
         for col in changed_df.columns:
             styles[col] = changed_df[col].map(
-                lambda c: "background-color: #FFF3B0; font-weight: bold;" if c else "")
+                lambda c: "background-color: #FCEFC7; font-weight: 600;" if c else "")
         return styles
     return display_df.style.apply(style_func, axis=None)
 
@@ -187,21 +187,52 @@ def relative_stats(r: pd.Series, b: pd.Series) -> dict:
 
 
 # ---------------- Charts ----------------
+FONT = "IBM Plex Sans"
+
+
+def _x():
+    return alt.X("date:T", title=None,
+                 axis=alt.Axis(format="%Y", tickCount={"interval": "year", "step": 2}, labelAngle=0))
+
+
 def _ts(idx: pd.PeriodIndex) -> pd.DatetimeIndex:
     return idx.to_timestamp()
 
 
-def line_chart(df: pd.DataFrame, y_title: str, fmt: str = ".2f", colors: dict | None = None):
+def _style(chart, height: int = 320):
+    """Shared chart look: no frame, light grid, site fonts."""
+    return (chart.properties(height=height)
+            .configure_view(strokeWidth=0)
+            .configure_axis(labelFont=FONT, titleFont=FONT, labelColor="#6B7488", titleColor="#6B7488",
+                            gridColor="#E9EDF3", domainColor="#C9D1DE", tickColor="#C9D1DE",
+                            labelFontSize=11, titleFontSize=11, titleFontWeight="normal")
+            .configure_legend(labelFont=FONT, labelFontSize=12, labelColor="#1B2540",
+                              symbolStrokeWidth=3, orient="top", title=None)
+            .configure_title(font=FONT))
+
+
+def line_chart(df: pd.DataFrame, y_title, fmt: str = ".2f", colors: dict | None = None, height=320,
+               zero: bool = True, interpolate: str = "linear"):
     long = df.reset_index(names="date").melt("date", var_name="series", value_name="value")
     colors = colors or LINE_COLORS
-    return (alt.Chart(long).mark_line(strokeWidth=1.6)
-            .encode(x=alt.X("date:T", title=None),
-                    y=alt.Y("value:Q", title=y_title, axis=alt.Axis(format=fmt)),
-                    color=alt.Color("series:N", title=None,
-                                    scale=alt.Scale(domain=list(colors), range=list(colors.values())),
-                                    legend=alt.Legend(orient="top")),
-                    tooltip=["date:T", "series:N", alt.Tooltip("value:Q", format=fmt)])
-            .properties(height=320))
+    chart = (alt.Chart(long).mark_line(strokeWidth=2, interpolate=interpolate)
+             .encode(x=_x(),
+                     y=alt.Y("value:Q", title=y_title, axis=alt.Axis(format=fmt), scale=alt.Scale(zero=zero)),
+                     color=alt.Color("series:N", title=None,
+                                     scale=alt.Scale(domain=list(colors), range=list(colors.values()))),
+                     strokeDash=alt.condition(alt.datum.series == "Strategy", alt.value([1, 0]), alt.value([5, 3])),
+                     tooltip=["date:T", "series:N", alt.Tooltip("value:Q", format=fmt)]))
+    return _style(chart, height)
+
+
+def area_chart(s: pd.Series, y_title: str, fmt: str, color: str, height=220):
+    df = s.rename("value").reset_index(names="date")
+    chart = (alt.Chart(df).mark_area(interpolate="step-after", color=color, opacity=0.25,
+                                     line={"color": color, "strokeWidth": 1.5})
+             .encode(x=_x(),
+                     y=alt.Y("value:Q", title=y_title, axis=alt.Axis(format=fmt)),
+                     tooltip=["date:T", alt.Tooltip("value:Q", format=fmt)]))
+    return _style(chart, height)
 
 
 def weights_chart(w: pd.DataFrame):
@@ -210,48 +241,70 @@ def weights_chart(w: pd.DataFrame):
             .melt("date", var_name="asset", value_name="weight"))
     long["order"] = long["asset"].map({LABELS[a]: i for i, a in enumerate(order)})
     legend_order = [LABELS[a] for a in ["TBILL"] + ETFS]
-    return (alt.Chart(long).mark_area(interpolate="step-after")
-            .encode(x=alt.X("date:T", title=None),
-                    y=alt.Y("weight:Q", stack="zero", title=None,
-                            axis=alt.Axis(format=".0%", tickCount=10), scale=alt.Scale(domain=[0, 1])),
-                    color=alt.Color("asset:N", title=None,
-                                    scale=alt.Scale(domain=legend_order,
-                                                    range=[PALETTE[a] for a in ["TBILL"] + ETFS]),
-                                    legend=alt.Legend(orient="top")),
-                    order=alt.Order("order:Q"),
-                    tooltip=["date:T", "asset:N", alt.Tooltip("weight:Q", format=".1%")])
-            .properties(height=340))
+    chart = (alt.Chart(long).mark_area(interpolate="step-after")
+             .encode(x=_x(),
+                     y=alt.Y("weight:Q", stack="zero", title=None,
+                             axis=alt.Axis(format=".0%", tickCount=5), scale=alt.Scale(domain=[0, 1])),
+                     color=alt.Color("asset:N", title=None,
+                                     scale=alt.Scale(domain=legend_order,
+                                                     range=[PALETTE[a] for a in ["TBILL"] + ETFS])),
+                     order=alt.Order("order:Q"),
+                     tooltip=["date:T", "asset:N", alt.Tooltip("weight:Q", format=".1%")]))
+    return _style(chart, 320)
 
 
-def zscore_chart(z: pd.DataFrame, pos: pd.DataFrame):
+def zscore_chart(z: pd.DataFrame):
     long = z.reset_index(names="date").melt("date", var_name="ETF", value_name="z")
-    base = alt.Chart(long).mark_line(strokeWidth=1.3).encode(
-        x=alt.X("date:T", title=None),
-        y=alt.Y("z:Q", title="z-score"),
-        color=alt.Color("ETF:N", scale=alt.Scale(domain=ETFS, range=[PALETTE[e] for e in ETFS]),
-                        legend=alt.Legend(orient="top", title=None)),
+    band = alt.Chart(pd.DataFrame({"lo": [EXIT_Z], "hi": [ENTER_Z]})).mark_rect(
+        color="#F4F6FA").encode(y="lo:Q", y2="hi:Q")
+    lines = alt.Chart(long).mark_line(strokeWidth=1.6).encode(
+        x=_x(),
+        y=alt.Y("z:Q", title="Z-score"),
+        color=alt.Color("ETF:N", scale=alt.Scale(domain=ETFS, range=[PALETTE[e] for e in ETFS])),
         tooltip=["date:T", "ETF:N", alt.Tooltip("z:Q", format=".2f")])
     rules = alt.Chart(pd.DataFrame({"y": [ENTER_Z, EXIT_Z]})).mark_rule(
-        strokeDash=[5, 4], color="grey").encode(y="y:Q")
-    return (base + rules).properties(height=300)
+        strokeDash=[4, 4], color="#9AA3B5").encode(y="y:Q")
+    return _style(band + rules + lines, 280)
+
+
+# ---------------- Table styling ----------------
+def style_signal_table(df: pd.DataFrame):
+    def action_color(v):
+        if isinstance(v, str) and v.startswith(("Buy", "Hold")):
+            return "color: #22397a; font-weight: 600;"
+        if isinstance(v, str) and v.startswith("Sell"):
+            return "color: #b23a3a; font-weight: 600;"
+        if v == "Fallback (cash)":
+            return "color: #1B2540; font-weight: 600;"
+        return "color: #6B7488;"
+    df = df.copy()
+    df["Carry (%p)"] = df["Carry (%p)"].map(lambda v: "\u2013" if pd.isna(v) else f"{v:.2f}")
+    df["Z-score"] = df["Z-score"].map(lambda v: "\u2013" if pd.isna(v) else f"{v:+.2f}")
+    df["Weight (%)"] = df["Weight (%)"].map(lambda v: f"{v:.1f}")
+    return df.style.map(action_color, subset=["Action"])
+
+
+def style_perf_table(df: pd.DataFrame, pct_cols: list, dec_cols: list):
+    fmt = {c: "{:.2f}" for c in pct_cols + dec_cols}
+    return (df.style.format(fmt)
+            .apply(lambda r: ["background-color: #EEF3FC; font-weight: 600;" if r.name == "Strategy" else ""
+                              for _ in r], axis=1))
 
 
 # ---------------- Layout ----------------
 def render():
-    st.header("Carry \u2014 US Treasury ETFs")
+    st.header("Carry")
+    st.caption(
+        f"Each month, compare every maturity's carry (its Treasury yield minus the 3-month T-bill) "
+        f"with its own last {WINDOW} months. Buy when the z-score rises above +{ENTER_Z}, sell when it "
+        f"falls below {EXIT_Z}, hold otherwise. Held ETFs are equal-weighted; with none held, the "
+        "portfolio sits 100% in 3-month T-bills."
+    )
 
-    subtab1, subtab2 = st.tabs(["\U0001F534 Live Signal (This Month)", "\U0001F4CA Historical Backtest"])
+    subtab1, subtab2 = st.tabs(["This month's signal", "Historical backtest"])
 
     # ---------- Live signal ----------
     with subtab1:
-        st.subheader("This Month's Recommended Positioning")
-        st.caption(
-            f"Carry = matched Treasury yield (DGS2 / DGS5 / DGS10 / DGS20) \u2212 3M T-bill (DGS3MO). "
-            f"Z-score over the last {WINDOW} months. Hysteresis rule: Long if Z > {ENTER_Z}, "
-            f"Sell to cash if Z < {EXIT_Z}, otherwise hold. Held ETFs are equal-weighted; "
-            "if none are Long, 100% goes to the 3-month T-bill. "
-            "Signal uses the last completed month-end and applies to the current month."
-        )
         with st.spinner("Fetching yields and computing this month's signal..."):
             try:
                 ylds, source = load_yields()
@@ -259,38 +312,40 @@ def render():
                 table = build_live_table(sig, ylds)
                 t = sig["pos"].index[-1]
                 n_long = int(sig["pos"].loc[t].sum())
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Positioning for", str(t + 1))
-                c2.metric("Signal as of (month-end)", str(t))
-                c3.metric("ETFs held", f"{n_long} / 4", "100% T-bill" if n_long == 0 else None,
-                          delta_color="off")
-
-                st.dataframe(table, width="stretch", hide_index=True)
-                st.caption(f"Yield data source: {source}.")
-
-                st.subheader("Recent History \u2014 What Were We Meant to Be Carrying")
-                st.caption("Last 6 months' positioning, most recent first \u2014 highlighted cells "
-                           "mark a change from the prior month (a flip in/out of that position).")
-                recent_display, recent_changed = build_recent_history(sig["pos"], n_months=6)
-                st.dataframe(highlight_changes(recent_display, recent_changed),
-                             width="stretch", hide_index=True)
-
-                st.subheader(f"Carry z-score ({WINDOW}m) \u2014 last 10 years")
-                z_recent = sig["z"].loc[t - 119:t]
-                z_recent.index = _ts(z_recent.index)
-                st.altair_chart(zscore_chart(z_recent, sig["pos"]), width="stretch")
-                st.caption(f"Dashed lines = entry (+{ENTER_Z}) and exit ({EXIT_Z}) thresholds.")
             except Exception as e:
-                st.error("Couldn't compute the live signal. Try refreshing in a few minutes.")
+                st.error("The live signal couldn't be computed. Refresh the page in a few minutes.")
                 st.exception(e)
+                return
+
+        st.subheader("This Month's Recommended Positioning")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Positioning for", (t + 1).strftime("%B %Y"))
+        c2.metric("Signal as of", f"{t.strftime('%b %Y')} month-end")
+        c3.metric("ETFs held", f"{n_long} of 4" if n_long else "None \u2014 100% T-bill")
+
+        st.dataframe(style_signal_table(table), width="stretch", hide_index=True)
+        st.caption(f"Yields from {source}. Carry and z-score use the last completed month-end.")
+
+        st.subheader("Recent History")
+        st.caption("What the strategy held over the last 6 months, most recent first. "
+                   "Highlighted cells mark a flip from the month before.")
+        recent_display, recent_changed = build_recent_history(sig["pos"], n_months=6)
+        st.dataframe(highlight_changes(recent_display, recent_changed), width="stretch", hide_index=True)
+
+        st.subheader(f"Carry Z-score, Last 10 Years")
+        z_recent = sig["z"].loc[t - 119:t]
+        z_recent.index = _ts(z_recent.index)
+        st.altair_chart(zscore_chart(z_recent), width="stretch")
+        st.caption(f"Shaded band = hold zone between {EXIT_Z} and +{ENTER_Z}. "
+                   "Above it the ETF is bought, below it the ETF is sold.")
 
     # ---------- Historical backtest ----------
     with subtab2:
         try:
             bt = load_backtest()
         except FileNotFoundError:
-            st.info("carry/data/carry_backtest.csv not found \u2014 run step 7 of the notebook and commit it.")
+            st.info("Backtest results are missing. Run step 7 of the notebook and commit "
+                    "carry/data/carry_backtest.csv.")
             return
 
         cmp = bt.dropna(subset=["ret_bbg"])                   # common period with the Bloomberg index
@@ -307,51 +362,47 @@ def render():
         c2.metric("End", rets.index[-1].strftime("%b %Y"))
         c3.metric("Length", f"{len(rets)} months ({len(rets) / 12:.1f} yrs)")
         st.caption(
-            f"Start = first month all 4 ETFs have returns (IEI launched Jan 2007). "
-            f"End = last month of the Bloomberg US Treasury Index data, so all three series are "
-            f"compared over the same period. Weights, duration and turnover below run to "
-            f"{bt.index[-1].strftime('%b %Y')}."
+            f"Starts in the first month all 4 ETFs have returns (IEI launched Jan 2007) and ends with the "
+            f"last month of Bloomberg index data, so all three series cover the same period. Weights, "
+            f"duration and turnover run to {bt.index[-1].strftime('%b %Y')}. Monthly rebalancing, "
+            "ETF total returns (NAV + distributions), no transaction costs."
         )
 
-        st.subheader("Cumulative Growth of $1")
-        st.caption(
-            f"Strategy: {WINDOW}m z-score, +{ENTER_Z} / {EXIT_Z} thresholds, monthly rebalance, "
-            f"no transaction costs. ETF total returns (NAV + distributions). "
-            f"Period: {rets.index[0]} \u2013 {rets.index[-1]} ({len(rets)} months)."
-        )
+        st.subheader("Growth of $1")
         wealth = (1 + rets).cumprod()
         wealth.index = _ts(wealth.index)
-        st.altair_chart(line_chart(wealth, "Growth of $1"), width="stretch")
+        st.altair_chart(line_chart(wealth, None, fmt="$.2f", zero=False), width="stretch")
 
         st.subheader("Performance Summary")
-        st.dataframe(pd.DataFrame({c: perf_stats(rets[c], rf) for c in rets}).T,
-                     width="stretch")
-        st.caption("Sharpe / Sortino use the 3M T-bill as the risk-free rate.")
-
-        st.subheader("Relative to Benchmarks")
-        st.dataframe(pd.DataFrame({
+        perf = pd.DataFrame({c: perf_stats(rets[c], rf) for c in rets}).T
+        st.dataframe(style_perf_table(perf, ["CAGR (%)", "Vol (%)", "Max Drawdown (%)"],
+                                      ["Sharpe", "Sortino", "Calmar"]), width="stretch")
+        rel = pd.DataFrame({
             f"vs {b}": relative_stats(rets["Strategy"], rets[b])
             for b in ["Equal weight (25% each)", "Bloomberg US Treasury Index"]
-        }).T, width="stretch")
+        }).T
+        st.dataframe(rel.style.format("{:.2f}"), width="stretch")
+        st.caption("Sharpe and Sortino use the 3-month T-bill as the risk-free rate. "
+                   "Excess return, tracking error and capture ratios compare the strategy with each benchmark.")
 
         st.subheader("Drawdown")
         dd = wealth / wealth.cummax() - 1
-        st.altair_chart(line_chart(dd, "Drawdown", fmt=".0%"), width="stretch")
+        st.altair_chart(line_chart(dd, None, fmt=".0%", height=240), width="stretch")
 
         st.subheader("Asset Weights")
         w = bt[[f"w_{a}" for a in ETFS + ["TBILL"]]].rename(columns=lambda c: c[2:])
         w.index = _ts(w.index)
         st.altair_chart(weights_chart(w), width="stretch")
 
-        st.subheader("Portfolio Duration (OAD)")
+        st.subheader("Portfolio Duration")
         d = bt[["dur_strategy", "dur_ew", "dur_bbg"]].rename(columns={
             "dur_strategy": "Strategy", "dur_ew": "Equal weight (25% each)",
             "dur_bbg": "Bloomberg US Treasury Index"})
         d.index = _ts(d.index)
-        st.altair_chart(line_chart(d, "Years", fmt=".1f"), width="stretch")
-        st.caption("Weighted Bloomberg index OAD of each held ETF's index; T-bill = 0.25 years.")
+        st.altair_chart(line_chart(d, "Years (OAD)", fmt=".0f", height=280, interpolate="step-after"), width="stretch")
+        st.caption("Weighted Bloomberg index option-adjusted duration of each held ETF; T-bill = 0.25 years.")
 
-        st.subheader("Turnover & Position Flips")
+        st.subheader("Turnover and Position Flips")
         pos = (bt[[f"w_{e}" for e in ETFS]] > 0).astype(int)
         pos.columns = ETFS
         chg = pos.diff().fillna(0)
@@ -360,9 +411,10 @@ def render():
         c1.metric("Annual turnover (one-way)", f"{bt['turnover'].mean() * 12:.0%}")
         c2.metric("Months with a trade", f"{(bt['turnover'] > 0.01).mean():.0%}")
         c3.metric("Total flips", f"{int((chg != 0).sum().sum())}")
-        st.dataframe(pd.DataFrame({
+        flips = pd.DataFrame({
             "Buys": (chg == 1).sum(),
             "Sells": (chg == -1).sum(),
-            "Flips / yr": ((chg != 0).sum() / n_years).round(2),
-            "% months held": (pos.mean() * 100).round(1),
-        }), width="stretch")
+            "Flips / yr": (chg != 0).sum() / n_years,
+            "% months held": pos.mean() * 100,
+        })
+        st.dataframe(flips.style.format({"Flips / yr": "{:.2f}", "% months held": "{:.1f}"}), width="stretch")
