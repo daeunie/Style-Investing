@@ -1,31 +1,34 @@
 """
 Style Investing -- main entry point
 --------------------------------------
-This is the file to point Streamlit Cloud's "Main file path" at
-(not carry/app.py anymore). It sets up the whole site's page config
-and title once, then delegates each top-level tab to that factor's own
-render() function.
+Point Streamlit Cloud's "Main file path" at this file. It sets the page
+config, applies the shared site style, and delegates each top-level tab
+to that factor's own render() function.
 
-Repo layout this expects:
+Repo layout:
     app.py                     <- this file
-    carry/carry_tab.py         <- Carry factor (done)
+    site_style.py              <- shared CSS + page header
+    .streamlit/config.toml     <- theme colours
+    carry/carry_tab.py         <- Carry factor
     carry/data/*.csv
-    momentum/momentum_tab.py   <- Momentum factor (placeholder for now)
-    value/value_tab.py         <- Value factor (placeholder for now)
+    momentum/momentum_tab.py   <- Momentum factor
+    value/value_tab.py         <- Value factor
 """
 
 import streamlit as st
 
-from carry.carry_tab import render as render_carry
-from momentum.momentum_tab import render as render_momentum
-from value.value_tab import render as render_value
+st.set_page_config(page_title="Style Investing", page_icon="\U0001F4C8", layout="wide")
 
-st.set_page_config(page_title="Style Investing", layout="wide")
+from site_style import apply_style, hero  # noqa: E402
+from carry.carry_tab import render as render_carry  # noqa: E402
+from momentum.momentum_tab import render as render_momentum  # noqa: E402
+from value.value_tab import render as render_value  # noqa: E402
 
-st.title("Style Investing")
-st.caption(
-    "AQR-style factor investing \u2014 carry, momentum, value \u2014 applied to US "
-    "Treasury ETFs, adapted from Brooks, Palhares & Richardson (2018)."
+apply_style()
+hero(
+    "Style Investing",
+    "AQR-style factor investing \u2014 carry, momentum and value \u2014 applied to US Treasury "
+    "ETFs, adapted from Brooks, Palhares &amp; Richardson (2018). KSIF Strategic Asset Allocation Team.",
 )
 
 tab_carry, tab_momentum, tab_value = st.tabs(["Carry", "Momentum", "Value"])
