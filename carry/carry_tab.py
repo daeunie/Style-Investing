@@ -1,322 +1,356 @@
 """
-Carry-Timing Strategy -- Carry tab module
--------------------------------------------
-Everything that used to be its own standalone app.py, now wrapped in a
-render() function so it can be called from inside a tab of the main
-"Style Investing" site instead of running as its own separate app.
+Carry tab -- carry timing on US Treasury ETFs (long-only, T-bill fallback)
+---------------------------------------------------------------------------
+Signal
+    carry_i  = matched Treasury yield (DGS2/5/10/20) - 3M T-bill (DGS3MO), month-end
+    z_i      = (carry_i - rolling mean) / rolling std over the last WINDOW months
+    Long if z > ENTER_Z, sell to T-bill if z < EXIT_Z, otherwise hold (hysteresis)
+    Held ETFs equal-weighted; none held -> 100% 3M T-bill
+Timing
+    Signal at month-end t -> positioning held over month t+1
 
-No st.set_page_config() or top-level st.title() here -- those belong
-to the main entry point (style-investing/app.py) since Streamlit only
-allows page config to be set once.
+Live Signal sub-tab : yields fetched from FRED on page load (cached 6h);
+                      falls back to data/yields_monthly.csv if FRED is unreachable.
+Historical sub-tab  : reads data/carry_backtest.csv (exported by step 7 of the notebook).
 """
 
-import os
+from pathlib import Path
 
+import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-CARRY_TESTED = ["SHY", "IEI", "IEF", "TLT"]
-TTM_WINDOW = 12
-ZSCORE_WINDOW = 72
-ENTER_Z = 1.0
-EXIT_Z = -1.0
+# ---------------- Settings ----------------
+DATA_DIR = Path(__file__).resolve().parent / "data"      # works regardless of working directory
+ETFS = ["SHY", "IEI", "IEF", "TLT"]
+YIELD_MAP = {"SHY": "DGS2", "IEI": "DGS5", "IEF": "DGS10", "TLT": "DGS20"}
+TBILL = "DGS3MO"
+WINDOW = 72            # z-score look-back (months)
+ENTER_Z = 1.0          # long above
+EXIT_Z = -1.0          # sell below
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={}"
 
-FRED_TBILL_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
-
-# Absolute path to this module's own data/ folder, so it works
-# regardless of which directory Streamlit's main script runs from.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_BACKTEST_CSV = os.path.join(_THIS_DIR, "data", "portfolio_backtest_final.csv")
+PALETTE = {"TBILL": "#b5b2ab", "SHY": "#a4c0ec", "IEI": "#6b95dc", "IEF": "#3f6bc4", "TLT": "#22397a"}
+LABELS = {"TBILL": "T-bill (cash)", "SHY": "SHY", "IEI": "IEI", "IEF": "IEF", "TLT": "TLT"}
+LINE_COLORS = {"Strategy": "#3f6bc4", "Equal weight (25% each)": "#222222",
+               "Bloomberg US Treasury Index": "#e8843a"}
 
 
-# ==================== Live Signal ====================
-
-@st.cache_data(ttl=3600 * 6)
-def fetch_etf_monthly(ticker: str) -> pd.DataFrame:
-    t = yf.Ticker(ticker)
-    hist = t.history(period="5y", interval="1d", auto_adjust=False)
-    hist = hist.reset_index()
-    hist["ym"] = hist["Date"].dt.to_period("M")
-
-    monthly_price = hist.groupby("ym")["Close"].last()
-    monthly_div = hist.groupby("ym")["Dividends"].sum()
-
-    df = pd.DataFrame({"nav": monthly_price, "distribution": monthly_div}).reset_index()
-    df["maturity"] = ticker
+# ---------------- Data ----------------
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_fred_yields() -> pd.DataFrame:
+    """Month-end yields from FRED (no API key needed)."""
+    out = {}
+    for sid in list(YIELD_MAP.values()) + [TBILL]:
+        s = pd.read_csv(FRED_CSV.format(sid), index_col=0, parse_dates=True, na_values=".").iloc[:, 0]
+        out[sid] = s.astype(float).dropna().resample("ME").last()
+    df = pd.DataFrame(out)
+    df.index = df.index.to_period("M")
     return df
 
 
-@st.cache_data(ttl=3600 * 6)
-def fetch_tbill_monthly() -> pd.DataFrame:
-    raw = pd.read_csv(FRED_TBILL_URL)
-    raw.columns = ["date", "tbill"]
-    raw["date"] = pd.to_datetime(raw["date"])
-    raw["tbill"] = pd.to_numeric(raw["tbill"], errors="coerce")
-    raw["ym"] = raw["date"].dt.to_period("M")
-    return raw.dropna(subset=["tbill"]).groupby("ym")["tbill"].last().reset_index()
+def load_yields() -> tuple[pd.DataFrame, str]:
+    try:
+        df, source = fetch_fred_yields(), "FRED (live)"
+    except Exception:
+        df = pd.read_csv(DATA_DIR / "yields_monthly.csv", index_col="ym")
+        df.index = pd.PeriodIndex(df.index, freq="M")
+        source = "stored file (FRED unreachable)"
+    current = pd.Timestamp.today().to_period("M")
+    return df.loc[df.index < current], source          # use completed months only
 
 
-@st.cache_data(ttl=3600 * 6)
-def build_live_dataset() -> pd.DataFrame:
-    frames = [fetch_etf_monthly(t) for t in CARRY_TESTED]
-    long_df = pd.concat(frames, ignore_index=True)
-    tbill_monthly = fetch_tbill_monthly()
-    long_df = long_df.merge(tbill_monthly, on="ym", how="left")
-    return long_df.sort_values(["maturity", "ym"]).reset_index(drop=True)
-
-
-@st.cache_data(ttl=3600 * 6)
-def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """TTM yield -> carry_adj -> Z-score -> signal. Uses float('nan'),
-    not pd.NA, since there's no CSV round-trip here to silently
-    convert it (unlike the notebook, which saves/reloads between
-    every step)."""
-
-    df = df.sort_values(["maturity", "ym"]).reset_index(drop=True)
-
-    trailing_dist = df.groupby("maturity")["distribution"].transform(
-        lambda x: x.rolling(window=TTM_WINDOW, min_periods=TTM_WINDOW).sum()
-    )
-    df["ttm_yield"] = (trailing_dist / df["nav"]) * 100
-
-    def compute_carry(row):
-        if pd.isna(row["ttm_yield"]) or pd.isna(row["tbill"]):
-            return float("nan")
-        return row["ttm_yield"] - row["tbill"]
-
-    df["carry_adj"] = df.apply(compute_carry, axis=1)
-
-    shifted = df.groupby("maturity")["carry_adj"].shift(1)
-    df["carry_mean"] = shifted.groupby(df["maturity"]).transform(
-        lambda x: x.rolling(window=ZSCORE_WINDOW, min_periods=ZSCORE_WINDOW).mean()
-    )
-    df["carry_std"] = shifted.groupby(df["maturity"]).transform(
-        lambda x: x.rolling(window=ZSCORE_WINDOW, min_periods=ZSCORE_WINDOW).std()
-    )
-    df["z"] = (df["carry_adj"] - df["carry_mean"]) / df["carry_std"]
-
-    df["signal"] = pd.NA
-    for maturity in CARRY_TESTED:
-        mask = df["maturity"] == maturity
-        idx = df[mask].index
-        position = "Cash"
-        signals = []
-        for i in idx:
-            z = df.loc[i, "z"]
-            if pd.notna(z):
-                if z > ENTER_Z:
-                    position = "Long"
-                elif z < EXIT_Z:
-                    position = "Cash"
-            signals.append(position)
-        df.loc[idx, "signal"] = signals
-
+@st.cache_data(show_spinner=False)
+def load_backtest() -> pd.DataFrame:
+    df = pd.read_csv(DATA_DIR / "carry_backtest.csv", index_col="ym")
+    df.index = pd.PeriodIndex(df.index, freq="M")
     return df
 
 
-def get_action(prior_signal, latest_signal) -> str:
-    if prior_signal == "Cash" and latest_signal == "Long":
-        return "Long (Buy)"
-    elif prior_signal == "Long" and latest_signal == "Cash":
-        return "Sell (to Cash)"
-    elif latest_signal == "Long":
-        return "Hold (Long)"
-    else:
-        return "Hold (Cash)"
+# ---------------- Signal ----------------
+def compute_signal(ylds: pd.DataFrame) -> dict:
+    carry = pd.DataFrame({etf: ylds[y] - ylds[TBILL] for etf, y in YIELD_MAP.items()})
+    mu = carry.rolling(WINDOW, min_periods=WINDOW).mean()
+    sd = carry.rolling(WINDOW, min_periods=WINDOW).std()
+    z = (carry - mu) / sd
+
+    pos = pd.DataFrame(0, index=z.index, columns=ETFS)
+    for etf in ETFS:
+        state = 0
+        for t, v in z[etf].items():
+            if np.isnan(v):
+                state = 0
+            elif v > ENTER_Z:
+                state = 1
+            elif v < EXIT_Z:
+                state = 0
+            pos.at[t, etf] = state
+    return {"carry": carry, "z": z, "pos": pos}
 
 
-def build_live_table(df: pd.DataFrame) -> pd.DataFrame:
+def build_live_table(sig: dict, ylds: pd.DataFrame) -> pd.DataFrame:
+    pos, z, carry = sig["pos"], sig["z"], sig["carry"]
+    t = pos.index[-1]
+    now, prev = pos.loc[t], pos.iloc[-2]
+    n_long = int(now.sum())
     rows = []
-    n_long = 0
-    for maturity in CARRY_TESTED:
-        m_df = df[df["maturity"] == maturity].sort_values("ym")
-        latest, prior = m_df.iloc[-1], m_df.iloc[-2]
-        action = get_action(prior["signal"], latest["signal"])
-        is_long = latest["signal"] == "Long"
-        if is_long:
-            n_long += 1
+    for etf in ETFS:
+        if now[etf] and not prev[etf]:
+            action = "Buy (Long)"
+        elif now[etf]:
+            action = "Hold (Long)"
+        elif prev[etf]:
+            action = "Sell (to Cash)"
+        else:
+            action = "Stay out (Cash)"
         rows.append({
-            "Instrument": maturity,
-            "As of": str(latest["ym"]),
-            "Carry_adj": round(latest["carry_adj"], 4) if pd.notna(latest["carry_adj"]) else None,
-            "Z-score": round(latest["z"], 3) if pd.notna(latest["z"]) else None,
+            "Instrument": etf,
+            "Yield used": YIELD_MAP[etf],
+            "Carry (%p)": round(carry.at[t, etf], 3),
+            "Z-score": round(z.at[t, etf], 2),
             "Action": action,
-            "_is_long": is_long,
+            "Weight (%)": round(100 / n_long, 1) if (now[etf] and n_long) else 0.0,
         })
-    for row in rows:
-        row["Weight (%)"] = round(100 / n_long, 1) if (row["_is_long"] and n_long > 0) else 0.0
-        del row["_is_long"]
-
-    tbill_latest = df.sort_values("ym").iloc[-1]
     rows.append({
         "Instrument": "3-Month T-Bill",
-        "As of": str(tbill_latest["ym"]),
-        "Carry_adj": None,
+        "Yield used": f"{TBILL} = {ylds.at[t, TBILL]:.2f}%",
+        "Carry (%p)": None,
         "Z-score": None,
-        "Action": "Cash reference (fallback)",
+        "Action": "Fallback (cash)" if n_long == 0 else "Not used",
         "Weight (%)": 100.0 if n_long == 0 else 0.0,
     })
     return pd.DataFrame(rows)
 
 
-def build_recent_history(df: pd.DataFrame, n_months: int = 6):
-    """Trailing table: one row per month, one column per instrument,
-    showing what the strategy was actually holding and at what weight.
-    Also returns a parallel boolean frame marking which cells changed
-    from the prior month, so a flip can be visually highlighted."""
-
-    wide_signal = df.pivot(index="ym", columns="maturity", values="signal")
-    full_index = wide_signal.index
-    recent_months = full_index[-n_months:]
-
-    display_rows = []
-    changed_rows = []
-    for ym in recent_months:
-        idx_pos = full_index.get_loc(ym)
-        longs = [m for m in CARRY_TESTED if wide_signal.loc[ym, m] == "Long"]
-        n_long = len(longs)
-        was_tbill_active = False
-        if idx_pos > 0:
-            prior_ym = full_index[idx_pos - 1]
-            prior_longs = [m for m in CARRY_TESTED if wide_signal.loc[prior_ym, m] == "Long"]
-            was_tbill_active = len(prior_longs) == 0
-
-        row = {"Month": str(ym)}
-        changed = {"Month": False}
-        for m in CARRY_TESTED:
-            sig = wide_signal.loc[ym, m]
-            prior_sig = wide_signal.loc[full_index[idx_pos - 1], m] if idx_pos > 0 else None
-            if sig == "Long":
-                weight = round(100 / n_long, 1) if n_long > 0 else 0.0
-                row[m] = f"Long ({weight}%)"
-            else:
-                row[m] = "Cash (0%)"
-            changed[m] = (prior_sig is not None) and (sig != prior_sig)
-
-        is_tbill_active = n_long == 0
-        row["3-Month T-Bill"] = f"{100.0 if is_tbill_active else 0.0}%"
-        changed["3-Month T-Bill"] = (idx_pos > 0) and (is_tbill_active != was_tbill_active)
-
-        display_rows.append(row)
-        changed_rows.append(changed)
-
-    display_df = pd.DataFrame(display_rows).iloc[::-1].reset_index(drop=True)
-    changed_df = pd.DataFrame(changed_rows).iloc[::-1].reset_index(drop=True)
-    return display_df, changed_df
+def build_recent_history(pos: pd.DataFrame, n_months: int = 6):
+    """Last n months of positioning (most recent first) + a mask of cells that changed vs prior month.
+    Row label = month the position is HELD (signal month-end + 1)."""
+    recent = pos.iloc[-(n_months + 1):]
+    rows, changed = [], []
+    for i in range(1, len(recent)):
+        now, prev = recent.iloc[i], recent.iloc[i - 1]
+        n_now, n_prev = int(now.sum()), int(prev.sum())
+        row = {"Held in": str(recent.index[i] + 1)}
+        chg = {"Held in": False}
+        for etf in ETFS:
+            row[etf] = f"Long ({100 / n_now:.1f}%)" if now[etf] else "Cash (0%)"
+            chg[etf] = bool(now[etf] != prev[etf])
+        row["3-Month T-Bill"] = "100.0%" if n_now == 0 else "0.0%"
+        chg["3-Month T-Bill"] = (n_now == 0) != (n_prev == 0)
+        rows.append(row)
+        changed.append(chg)
+    return pd.DataFrame(rows[::-1]), pd.DataFrame(changed[::-1])
 
 
 def highlight_changes(display_df: pd.DataFrame, changed_df: pd.DataFrame):
-    """Return a pandas Styler that highlights any cell marked True in
-    changed_df with a yellow background and bold text."""
-
     def style_func(_):
         styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
         for col in changed_df.columns:
             styles[col] = changed_df[col].map(
-                lambda changed: "background-color: #FFF3B0; font-weight: bold;" if changed else ""
-            )
+                lambda c: "background-color: #FFF3B0; font-weight: bold;" if c else "")
         return styles
-
     return display_df.style.apply(style_func, axis=None)
 
 
-# ==================== Historical Backtest (static, pre-computed) ====================
-
-def max_drawdown(cum_series: pd.Series) -> float:
-    running_max = cum_series.cummax()
-    return ((cum_series - running_max) / running_max).min() * 100
-
-
-def summarize_backtest(portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    n_months = len(portfolio_df)
-    rows = []
-    for label, ret_col, cum_col in [
-        ("Strategy (72mo Z-score, \u00b11.0 threshold)", "strategy_return", "cum_strategy"),
-        ("Benchmark 1: Equal-Weight", "benchmark_return", "cum_benchmark"),
-        ("Benchmark 2: Bloomberg US Treasury Index", "bbg_return", "cum_bbg"),
-    ]:
-        cagr = portfolio_df[cum_col].iloc[-1] ** (12 / n_months) - 1
-        vol = portfolio_df[ret_col].std() / 100 * (12 ** 0.5)
-        sharpe = cagr / vol if vol else float("nan")
-        mdd = max_drawdown(portfolio_df[cum_col])
-        rows.append({
-            "Portfolio": label,
-            "CAGR (%)": round(cagr * 100, 2),
-            "Vol (%, ann.)": round(vol * 100, 2),
-            "Sharpe*": round(sharpe, 2),
-            "Max Drawdown (%)": round(mdd, 2),
-        })
-    return pd.DataFrame(rows)
+# ---------------- Stats ----------------
+def perf_stats(r: pd.Series, rf: pd.Series) -> dict:
+    r = r.dropna()
+    rf = rf.reindex(r.index).fillna(0)
+    wealth = (1 + r).cumprod()
+    cagr = wealth.iloc[-1] ** (12 / len(r)) - 1
+    ex = r - rf
+    dd = wealth / wealth.cummax() - 1
+    return {
+        "CAGR (%)": round(cagr * 100, 2),
+        "Vol (%)": round(r.std() * np.sqrt(12) * 100, 2),
+        "Sharpe": round(ex.mean() / ex.std() * np.sqrt(12), 2),
+        "Sortino": round(ex.mean() / ex[ex < 0].std() * np.sqrt(12), 2),
+        "Max Drawdown (%)": round(dd.min() * 100, 2),
+        "Calmar": round(cagr / abs(dd.min()), 2),
+    }
 
 
-# ==================== Public entry point ====================
+def relative_stats(r: pd.Series, b: pd.Series) -> dict:
+    act = r - b
+    te = act.std() * np.sqrt(12)
+    up, dn = b > 0, b < 0
+    return {
+        "Excess return (%/yr)": round(act.mean() * 1200, 2),
+        "Tracking error (%)": round(te * 100, 2),
+        "Information ratio": round(act.mean() * 12 / te, 2),
+        "t-stat": round(act.mean() / act.std() * np.sqrt(len(act)), 2),
+        "Beta": round(np.cov(r, b)[0, 1] / b.var(), 2),
+        "Up capture (%)": round(r[up].mean() / b[up].mean() * 100, 1),
+        "Down capture (%)": round(r[dn].mean() / b[dn].mean() * 100, 1),
+    }
 
+
+# ---------------- Charts ----------------
+def _ts(idx: pd.PeriodIndex) -> pd.DatetimeIndex:
+    return idx.to_timestamp()
+
+
+def line_chart(df: pd.DataFrame, y_title: str, fmt: str = ".2f", colors: dict | None = None):
+    long = df.reset_index(names="date").melt("date", var_name="series", value_name="value")
+    colors = colors or LINE_COLORS
+    return (alt.Chart(long).mark_line(strokeWidth=1.6)
+            .encode(x=alt.X("date:T", title=None),
+                    y=alt.Y("value:Q", title=y_title, axis=alt.Axis(format=fmt)),
+                    color=alt.Color("series:N", title=None,
+                                    scale=alt.Scale(domain=list(colors), range=list(colors.values())),
+                                    legend=alt.Legend(orient="top")),
+                    tooltip=["date:T", "series:N", alt.Tooltip("value:Q", format=fmt)])
+            .properties(height=320))
+
+
+def weights_chart(w: pd.DataFrame):
+    order = ETFS + ["TBILL"]                                  # SHY bottom -> TLT -> T-bill on top
+    long = (w[order].rename(columns=LABELS).reset_index(names="date")
+            .melt("date", var_name="asset", value_name="weight"))
+    long["order"] = long["asset"].map({LABELS[a]: i for i, a in enumerate(order)})
+    legend_order = [LABELS[a] for a in ["TBILL"] + ETFS]
+    return (alt.Chart(long).mark_area(interpolate="step-after")
+            .encode(x=alt.X("date:T", title=None),
+                    y=alt.Y("weight:Q", stack="zero", title=None,
+                            axis=alt.Axis(format=".0%", tickCount=10), scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("asset:N", title=None,
+                                    scale=alt.Scale(domain=legend_order,
+                                                    range=[PALETTE[a] for a in ["TBILL"] + ETFS]),
+                                    legend=alt.Legend(orient="top")),
+                    order=alt.Order("order:Q"),
+                    tooltip=["date:T", "asset:N", alt.Tooltip("weight:Q", format=".1%")])
+            .properties(height=340))
+
+
+def zscore_chart(z: pd.DataFrame, pos: pd.DataFrame):
+    long = z.reset_index(names="date").melt("date", var_name="ETF", value_name="z")
+    base = alt.Chart(long).mark_line(strokeWidth=1.3).encode(
+        x=alt.X("date:T", title=None),
+        y=alt.Y("z:Q", title="z-score"),
+        color=alt.Color("ETF:N", scale=alt.Scale(domain=ETFS, range=[PALETTE[e] for e in ETFS]),
+                        legend=alt.Legend(orient="top", title=None)),
+        tooltip=["date:T", "ETF:N", alt.Tooltip("z:Q", format=".2f")])
+    rules = alt.Chart(pd.DataFrame({"y": [ENTER_Z, EXIT_Z]})).mark_rule(
+        strokeDash=[5, 4], color="grey").encode(y="y:Q")
+    return (base + rules).properties(height=300)
+
+
+# ---------------- Layout ----------------
 def render():
-    """Call this from inside a st.tabs() block in the main app to
-    render the entire Carry section (its own two sub-tabs)."""
-
     st.header("Carry \u2014 US Treasury ETFs")
 
     subtab1, subtab2 = st.tabs(["\U0001F534 Live Signal (This Month)", "\U0001F4CA Historical Backtest"])
 
+    # ---------- Live signal ----------
     with subtab1:
         st.subheader("This Month's Recommended Positioning")
         st.caption(
-            f"Fetched live from Yahoo Finance and FRED (DGS3MO) \u2014 recomputed on every "
-            f"page load (cached 6h). Hysteresis rule: Long if Z > {ENTER_Z}, "
-            f"Sell to cash if Z < {EXIT_Z}, otherwise hold. All 4 ETFs are carry-tested; "
-            "if none are Long, 100% falls back to the 3-month T-bill."
+            f"Carry = matched Treasury yield (DGS2 / DGS5 / DGS10 / DGS20) \u2212 3M T-bill (DGS3MO). "
+            f"Z-score over the last {WINDOW} months. Hysteresis rule: Long if Z > {ENTER_Z}, "
+            f"Sell to cash if Z < {EXIT_Z}, otherwise hold. Held ETFs are equal-weighted; "
+            "if none are Long, 100% goes to the 3-month T-bill. "
+            "Signal uses the last completed month-end and applies to the current month."
         )
-        with st.spinner("Fetching live data and computing this month's signal..."):
+        with st.spinner("Fetching yields and computing this month's signal..."):
             try:
-                live_df = build_live_dataset()
-                signaled_df = compute_signals(live_df)
-                live_table = build_live_table(signaled_df)
-                st.dataframe(live_table, use_container_width=True, hide_index=True)
-                st.success(f"Live data as of {live_table['As of'].iloc[0]}")
+                ylds, source = load_yields()
+                sig = compute_signal(ylds)
+                table = build_live_table(sig, ylds)
+                t = sig["pos"].index[-1]
+                n_long = int(sig["pos"].loc[t].sum())
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Positioning for", str(t + 1))
+                c2.metric("Signal as of (month-end)", str(t))
+                c3.metric("ETFs held", f"{n_long} / 4", "100% T-bill" if n_long == 0 else None,
+                          delta_color="off")
+
+                st.dataframe(table, width="stretch", hide_index=True)
+                st.caption(f"Yield data source: {source}.")
 
                 st.subheader("Recent History \u2014 What Were We Meant to Be Carrying")
-                st.caption(
-                    "Last 6 months' positioning, most recent first \u2014 highlighted cells "
-                    "mark a change from the prior month (a flip in/out of that position)."
-                )
-                recent_display, recent_changed = build_recent_history(signaled_df, n_months=6)
-                st.dataframe(
-                    highlight_changes(recent_display, recent_changed),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.caption("Last 6 months' positioning, most recent first \u2014 highlighted cells "
+                           "mark a change from the prior month (a flip in/out of that position).")
+                recent_display, recent_changed = build_recent_history(sig["pos"], n_months=6)
+                st.dataframe(highlight_changes(recent_display, recent_changed),
+                             width="stretch", hide_index=True)
+
+                st.subheader(f"Carry z-score ({WINDOW}m) \u2014 last 10 years")
+                z_recent = sig["z"].loc[t - 119:t]
+                z_recent.index = _ts(z_recent.index)
+                st.altair_chart(zscore_chart(z_recent, sig["pos"]), width="stretch")
+                st.caption(f"Dashed lines = entry (+{ENTER_Z}) and exit ({EXIT_Z}) thresholds.")
             except Exception as e:
-                st.error("Couldn't fetch live data right now. Try refreshing in a few minutes.")
+                st.error("Couldn't compute the live signal. Try refreshing in a few minutes.")
                 st.exception(e)
 
+    # ---------- Historical backtest ----------
     with subtab2:
+        try:
+            bt = load_backtest()
+        except FileNotFoundError:
+            st.info("carry/data/carry_backtest.csv not found \u2014 run step 7 of the notebook and commit it.")
+            return
+
+        cmp = bt.dropna(subset=["ret_bbg"])                   # common period with the Bloomberg index
+        rets = pd.DataFrame({
+            "Strategy": cmp["ret_strategy"],
+            "Equal weight (25% each)": cmp["ret_ew"],
+            "Bloomberg US Treasury Index": cmp["ret_bbg"],
+        })
+        rf = cmp["ret_tbill"]
+
         st.subheader("Cumulative Growth of $1")
         st.caption(
-            "Strategy: 72-month Z-score, \u00b11.0 threshold (chosen by systematic "
-            "window/threshold search, not cherry-picked). Compared against two "
-            "benchmarks: equal-weight and the real Bloomberg US Treasury Index. "
-            "Fixed results from the notebook, not live data."
+            f"Strategy: {WINDOW}m z-score, +{ENTER_Z} / {EXIT_Z} thresholds, monthly rebalance, "
+            f"no transaction costs. ETF total returns (NAV + distributions). "
+            f"Period: {rets.index[0]} \u2013 {rets.index[-1]} ({len(rets)} months)."
         )
-        try:
-            portfolio_df = pd.read_csv(_BACKTEST_CSV, index_col="ym")
-            chart_df = portfolio_df[["cum_strategy", "cum_benchmark", "cum_bbg"]].rename(columns={
-                "cum_strategy": "Strategy (72mo Z-score, \u00b11.0)",
-                "cum_benchmark": "Benchmark 1: Equal-Weight",
-                "cum_bbg": "Benchmark 2: Bloomberg US Treasury Index",
-            })
-            st.line_chart(chart_df)
+        wealth = (1 + rets).cumprod()
+        wealth.index = _ts(wealth.index)
+        st.altair_chart(line_chart(wealth, "Growth of $1"), width="stretch")
 
-            st.subheader("Performance Summary")
-            st.dataframe(summarize_backtest(portfolio_df), use_container_width=True, hide_index=True)
-            st.caption(
-                "*Sharpe = raw return / vol, no risk-free subtraction \u2014 rough comparison only. "
-                f"Backtest window: {portfolio_df.index.min()} to {portfolio_df.index.max()} "
-                f"({len(portfolio_df)} months)."
-            )
-        except FileNotFoundError:
-            st.info(
-                "Historical backtest data not found. Upload carry/data/portfolio_backtest_final.csv "
-                "(from the notebook's export cell) to enable this tab."
-            )
+        st.subheader("Performance Summary")
+        st.dataframe(pd.DataFrame({c: perf_stats(rets[c], rf) for c in rets}).T,
+                     width="stretch")
+        st.caption("Sharpe / Sortino use the 3M T-bill as the risk-free rate.")
+
+        st.subheader("Relative to Benchmarks")
+        st.dataframe(pd.DataFrame({
+            f"vs {b}": relative_stats(rets["Strategy"], rets[b])
+            for b in ["Equal weight (25% each)", "Bloomberg US Treasury Index"]
+        }).T, width="stretch")
+
+        st.subheader("Drawdown")
+        dd = wealth / wealth.cummax() - 1
+        st.altair_chart(line_chart(dd, "Drawdown", fmt=".0%"), width="stretch")
+
+        st.subheader("Asset Weights")
+        w = bt[[f"w_{a}" for a in ETFS + ["TBILL"]]].rename(columns=lambda c: c[2:])
+        w.index = _ts(w.index)
+        st.altair_chart(weights_chart(w), width="stretch")
+
+        st.subheader("Portfolio Duration (OAD)")
+        d = bt[["dur_strategy", "dur_ew", "dur_bbg"]].rename(columns={
+            "dur_strategy": "Strategy", "dur_ew": "Equal weight (25% each)",
+            "dur_bbg": "Bloomberg US Treasury Index"})
+        d.index = _ts(d.index)
+        st.altair_chart(line_chart(d, "Years", fmt=".1f"), width="stretch")
+        st.caption("Weighted Bloomberg index OAD of each held ETF's index; T-bill = 0.25 years.")
+
+        st.subheader("Turnover & Position Flips")
+        pos = (bt[[f"w_{e}" for e in ETFS]] > 0).astype(int)
+        pos.columns = ETFS
+        chg = pos.diff().fillna(0)
+        n_years = len(bt) / 12
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Annual turnover (one-way)", f"{bt['turnover'].mean() * 12:.0%}")
+        c2.metric("Months with a trade", f"{(bt['turnover'] > 0.01).mean():.0%}")
+        c3.metric("Total flips", f"{int((chg != 0).sum().sum())}")
+        st.dataframe(pd.DataFrame({
+            "Buys": (chg == 1).sum(),
+            "Sells": (chg == -1).sum(),
+            "Flips / yr": ((chg != 0).sum() / n_years).round(2),
+            "% months held": (pos.mean() * 100).round(1),
+        }), width="stretch")
