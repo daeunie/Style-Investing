@@ -27,7 +27,7 @@ FRED_TBILL_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS3MO"
 # Absolute path to this module's own data/ folder, so it works
 # regardless of which directory Streamlit's main script runs from.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_BACKTEST_CSV = os.path.join(_THIS_DIR, "data", "portfolio_backtest_dynamic.csv")
+_BACKTEST_CSV = os.path.join(_THIS_DIR, "data", "portfolio_backtest_final.csv")
 
 
 # ==================== Live Signal ====================
@@ -232,8 +232,9 @@ def summarize_backtest(portfolio_df: pd.DataFrame) -> pd.DataFrame:
     n_months = len(portfolio_df)
     rows = []
     for label, ret_col, cum_col in [
-        ("Benchmark (25/25/25/25, static)", "benchmark_return", "cum_benchmark"),
-        ("Strategy (dynamic weight, timed)", "strategy_return", "cum_strategy"),
+        ("Strategy (72mo Z-score, \u00b11.0 threshold)", "strategy_return", "cum_strategy"),
+        ("Benchmark 1: Equal-Weight", "benchmark_return", "cum_benchmark"),
+        ("Benchmark 2: Bloomberg US Treasury Index", "bbg_return", "cum_bbg"),
     ]:
         cagr = portfolio_df[cum_col].iloc[-1] ** (12 / n_months) - 1
         vol = portfolio_df[ret_col].std() / 100 * (12 ** 0.5)
@@ -293,15 +294,17 @@ def render():
     with subtab2:
         st.subheader("Cumulative Growth of $1")
         st.caption(
-            "Results from the full historical backtest (notebook pipeline, 2007\u20132026, "
-            "using iShares' official monthly NAV returns). This tab shows fixed results, "
-            "not live data \u2014 re-run the notebook and re-upload the CSV to update it."
+            "Strategy: 72-month Z-score, \u00b11.0 threshold (chosen by systematic "
+            "window/threshold search, not cherry-picked). Compared against two "
+            "benchmarks: equal-weight and the real Bloomberg US Treasury Index. "
+            "Fixed results from the notebook, not live data."
         )
         try:
             portfolio_df = pd.read_csv(_BACKTEST_CSV, index_col="ym")
-            chart_df = portfolio_df[["cum_benchmark", "cum_strategy"]].rename(columns={
-                "cum_benchmark": "Benchmark (25/25/25/25, static)",
-                "cum_strategy": "Strategy (dynamic weight, timed)",
+            chart_df = portfolio_df[["cum_strategy", "cum_benchmark", "cum_bbg"]].rename(columns={
+                "cum_strategy": "Strategy (72mo Z-score, \u00b11.0)",
+                "cum_benchmark": "Benchmark 1: Equal-Weight",
+                "cum_bbg": "Benchmark 2: Bloomberg US Treasury Index",
             })
             st.line_chart(chart_df)
 
@@ -314,6 +317,6 @@ def render():
             )
         except FileNotFoundError:
             st.info(
-                "Historical backtest data not found. Upload carry/data/portfolio_backtest_dynamic.csv "
-                "(from Step 6 of the notebook pipeline) to enable this tab."
+                "Historical backtest data not found. Upload carry/data/portfolio_backtest_final.csv "
+                "(from the notebook's export cell) to enable this tab."
             )
